@@ -25,9 +25,9 @@ options:
 
 ## Operation
 
-* Download and configure `wikiget.awk`.  
-* Download article-titles to process
-* * `wikiget -b "Template:Caselaw source" -tt > titles.txt`
+* Download and configure `wikiget.awk`
+* Retrieve the list of article titles to process
+  * `wikiget -b "Template:Caselaw source" -tt > titles.txt`
 * Test then run the bot per examples below
 
 ## Examples
