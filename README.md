@@ -23,6 +23,13 @@ options:
   -l, --live            Enable LIVE upload mode (default is dry-run)
 ```
 
+## Operation
+
+* Download and configure `wikiget.awk`.  
+* Download article-titles to process
+* * `wikiget -b "Template:Caselaw source" -tt > titles.txt`
+* Test then run the bot per examples below
+
 ## Examples
 
 **Dry-run a single article with verbose output (Safe testing):**
