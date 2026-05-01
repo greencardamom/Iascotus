@@ -130,7 +130,9 @@ def insert_internetarchive(template_text, ia_result):
         if not last_ws: 
             last_ws = " "
             
-        clean_template = template_text.rstrip('} \n\r\t')
+        # Use regex to safely remove only the final closing braces of the parent template,
+        # avoiding the accidental destruction of nested template braces at the end of the line.
+        clean_template = re.sub(r'\s*\}\}\s*$', '', template_text)    
         styled_param = f"|{pad_pipe}internetarchive{pad_eq_left}={pad_eq_right}{ia_result}"
         
         # Determine if the template should close on a new line or inline
@@ -138,105 +140,156 @@ def insert_internetarchive(template_text, ia_result):
         
         return f"{clean_template}{last_ws}{styled_param}{close_brace}"
 
-def parse_case_string(case_str):
+def parse_case_string(case_str, template_text=""):
     """
-    Extracts and normalizes the SCOTUS citation from the raw |case= string.
-    Filters out lower court citations by strictly matching U.S., S. Ct., Dockets, or {{ussc}} templates.
+    Extracts and normalizes the SCOTUS citation and case name.
+    Mines external URLs for docket numbers on recent/slip opinions.
     """
     clean_str = re.sub(r"''+", "", case_str).strip()
     print_verbose(f"Parsing raw |case= string: '{clean_str}'")
     
-    # 1. Match nested {{ussc|...}} templates
+    params = {}
+    
+    # Scan the entire template for docket numbers hidden in external URLs
+    if template_text:
+        m_url = re.search(r'(?:justia\.com|oyez\.org|supremecourt\.gov|cornell\.edu).*?(?:/|=)(\d{2}-\d{3,4})\b', template_text, re.IGNORECASE)
+        if m_url:
+            print_verbose(f"Mined Docket No from template URLs: {m_url.group(1)}")
+            params["docket"] = m_url.group(1)
+            
+    # 1. Extract the case name for fallback API queries
+    if "name=" in clean_str.lower():
+        m = re.search(r'name\s*=\s*([^|}]+)', clean_str, re.IGNORECASE)
+        if m: params['name'] = m.group(1).strip()
+    else:
+        m = re.match(r'^([^,{]+)', clean_str)
+        if m: params['name'] = m.group(1).strip()
+            
+    # 2. Match nested {{ussc|...}} templates
     ussc_match = re.search(r'\{\{\s*ussc\s*\|(.*?)\}\}', clean_str, re.IGNORECASE)
     if ussc_match:
         print_verbose(f"Matched {{ussc}} template: {ussc_match.group(0)}")
-        params = ussc_match.group(1).split('|')
+        ussc_params = ussc_match.group(1).split('|')
         
-        # Check for named docket parameter first (e.g., docket=21-1454)
-        for p in params:
-            if 'docket' in p.lower() and '=' in p:
+        named_vol = None
+        named_page = None
+        
+        for p in ussc_params:
+            p_lower = p.lower()
+            if 'docket' in p_lower and '=' in p:
                 docket_val = p.split('=', 1)[1].strip()
                 m_dock = re.search(r'(\d{2}-\d{3,4})', docket_val)
                 if m_dock:
                     print_verbose(f"Extracted USSC docket: {m_dock.group(1)}")
-                    return {"docket": m_dock.group(1)}
-                    
-        # If no docket, extract positional volume and page (e.g., 113|40)
-        positional = [p.strip() for p in params if '=' not in p]
+                    params["docket"] = m_dock.group(1)
+                    return params
+            elif 'volume' in p_lower and '=' in p:
+                named_vol = p.split('=', 1)[1].strip()
+            elif 'page' in p_lower and '=' in p:
+                named_page = p.split('=', 1)[1].strip()
+
+        # Check if explicitly named volume and page were found
+        if named_vol and named_page:
+            if named_vol.isdigit() and (named_page.isdigit() or '_' in named_page):
+                print_verbose(f"Extracted USSC named parameters: {named_vol} U.S. {named_page}")
+                params["us"] = f"{named_vol} U.S. {named_page}"
+                return params
+                
+        # Fallback to positional extraction (e.g., 113|40)
+        positional = [p.strip() for p in ussc_params if '=' not in p]
         if len(positional) >= 2:
             vol = positional[0]
             page = positional[1]
-            if vol.isdigit() and page.isdigit():
+            if vol.isdigit() and (page.isdigit() or '_' in page):
                 print_verbose(f"Extracted USSC positional: {vol} U.S. {page}")
-                return {"us": f"{vol} U.S. {page}"}
+                params["us"] = f"{vol} U.S. {page}"
+                return params
 
-    # 2. Match standard U.S. citation
+    # 3. Match standard U.S. citation
     m = re.search(r'\b(\d+)\s+[Uu]\.?\s*[Ss]\.?\s+(\d+)\b', clean_str)
     if m:
         print_verbose(f"Matched official U.S. citation: {m.group(1)} U.S. {m.group(2)}")
-        return {"us": f"{m.group(1)} U.S. {m.group(2)}"}
+        params["us"] = f"{m.group(1)} U.S. {m.group(2)}"
+        return params
         
-    # 3. Match S. Ct. citation
+    # 4. Match S. Ct. citation
     m = re.search(r'\b(\d+)\s+[Ss]\.?\s*[Cc]t\.?\s+(\d+)\b', clean_str)
     if m:
         print_verbose(f"Matched S. Ct. citation: {m.group(1)} S. Ct. {m.group(2)}")
-        return {"sct": f"{m.group(1)} S. Ct. {m.group(2)}"}
+        params["sct"] = f"{m.group(1)} S. Ct. {m.group(2)}"
+        return params
         
-    # 4. Match Docket No.
+    # 5. Match Docket No.
     m = re.search(r'\b(\d{2}-\d{3,4})\b', clean_str)
     if m:
         print_verbose(f"Matched Docket No: {m.group(1)}")
-        return {"docket": m.group(1)}
+        params["docket"] = m.group(1)
+        return params
         
     print_verbose("No valid SCOTUS citation format found. Skipping.")
     return None
 
 def validate_ia_scotus(query_params):
     """
-    Queries the Internet Archive API returning JSON to check exact hit counts.
+    Queries the Internet Archive API returning JSON. 
+    Uses a strict citation search first, with a fallback to a literal case name search.
     """
+    def query_api(query_str):
+        url = f"https://archive.org/advancedsearch.php?q={urllib.parse.quote(query_str)}&fl[]=identifier&output=json&rows=5"
+        req = urllib.request.Request(url, headers={'User-Agent': 'WikipediaBot/1.0 (GreenC)'})
+        with urllib.request.urlopen(req) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            return data['response']['numFound'], data['response'].get('docs', []), url
+
+    # --- Stage 1: Strict Citation Search ---
     lucene_query = "collection:(us-supreme-court)"
     param_key, param_val = "", ""
     
     if "docket" in query_params:
-        lucene_query += f' AND description:"Docket No.: {query_params["docket"]}"'
+        lucene_query += f' AND title:"{query_params["docket"]}"'
         param_key, param_val = "docket", query_params["docket"]
     elif "us" in query_params:
-        lucene_query += f' AND description:"{query_params["us"]}"'
+        lucene_query += f' AND title:"{query_params["us"]}"'
         param_key, param_val = "us", query_params["us"]
     elif "sct" in query_params:
-        lucene_query += f' AND description:"{query_params["sct"]}"'
+        lucene_query += f' AND title:"{query_params["sct"]}"'
         param_key, param_val = "sct", query_params["sct"]
 
-    params = {
-        'q': lucene_query,
-        'fl[]': 'identifier',
-        'output': 'json',
-        'rows': '5'
-    }
-    
-    url = "https://archive.org/advancedsearch.php?" + urllib.parse.urlencode(params)
-    print_verbose(f"Querying IA API: {url}")
-    
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'WikipediaBot/1.0 (GreenC)'})
-        with urllib.request.urlopen(req) as response:
-            data = json.loads(response.read().decode('utf-8'))
-            hit_count = data['response']['numFound']
-            print_verbose(f"IA API returned {hit_count} hits.")
+        hit_count, docs, url1 = query_api(lucene_query)
+        print_verbose(f"IA API returned {hit_count} hits for citation search.")
+        
+        if hit_count == 1:
+            doc_id = docs[0]['identifier']
+            print_verbose(f"Success: Exact match found. ID: {doc_id}")
+            return f"{{{{IA SCOTUS URL |id={doc_id}}}}}", f"ID: {doc_id}", "1 item found", url1
             
-            if hit_count == 1:
-                doc_id = data['response']['docs'][0]['identifier']
-                print_verbose(f"Success: Exact match found. ID: {doc_id}")
-                return f"{{{{IA SCOTUS URL |id={doc_id}}}}}", f"ID: {doc_id}", "1 item found"
-            elif hit_count == 2:
-                print_verbose("Success: 2 matches found. Falling back to dynamic search template.")
-                return f"{{{{IA SCOTUS URL |{param_key}={param_val}}}}}", "items 2", "2 items found"
+        # --- Stage 2: Fallback Literal Name Search ---
+        if hit_count == 0 and "name" in query_params:
+            print_verbose(f"Strict search failed. Trying fallback literal case name: {query_params['name']}")
+            fallback_query = f'collection:(us-supreme-court) AND title:"{query_params["name"]}"'
+            hit_count_2, docs_2, url2 = query_api(fallback_query)
+            print_verbose(f"IA API returned {hit_count_2} hits for fallback search.")
+            
+            if hit_count_2 == 1:
+                doc_id = docs_2[0]['identifier']
+                print_verbose(f"Fallback Success: Exact match found. ID: {doc_id}")
+                return f"{{{{IA SCOTUS URL |id={doc_id}}}}}", f"ID: {doc_id}", "1 item found (fallback)", url2
+            elif hit_count_2 > 1:
+                return f"SKIP: returned {hit_count_2} results on fallback", f"items {hit_count_2}", f"{hit_count_2} fallback items found", url2
             else:
-                return f"SKIP: returned {hit_count} results", f"items {hit_count}", f"{hit_count} items found"
+                return f"SKIP: returned 0 results", "items 0", "0 items found", url2
+
+        # If Stage 1 had exactly 2 hits, fallback to the dynamic template
+        elif hit_count == 2:
+            print_verbose("Success: 2 matches found. Falling back to dynamic search template.")
+            return f"{{{{IA SCOTUS URL |{param_key}={param_val}}}}}", "items 2", "2 items found", url1
+        else:
+            return f"SKIP: returned {hit_count} results", f"items {hit_count}", f"{hit_count} items found", url1
+            
     except Exception as e:
         print_verbose(f"API Request Error: {str(e)}")
-        return f"ERROR: API request failed - {str(e)}", "API Error", "API Error"
+        return f"ERROR: API request failed - {str(e)}", "API Error", "API Error", "URL generation error"
 
 def get_closing_brace(text, start_idx):
     """Robust parser to find the exact closing braces of a wikitext template."""
@@ -355,18 +408,18 @@ def main():
                 if not modified: article_status = "Missing or unparseable |case= parameter"
                 continue
                 
-            query_params = parse_case_string(case_str)
+            query_params = parse_case_string(case_str, template_text)    
             if not query_params:
                 write_log("ia_scotus_error.log", title, template_text, "Filtered: No SCOTUS citation format found")
                 if not modified: article_status = "Filtered: No SCOTUS metadata found"
                 continue
                 
-            # Unpack the 3 variables from our updated function
-            ia_result, extra_col, api_status = validate_ia_scotus(query_params)
+            # Unpack the 4 variables from our updated function
+            ia_result, extra_col, api_status, query_url = validate_ia_scotus(query_params)
             
             if ia_result.startswith("SKIP") or ia_result.startswith("ERROR"):
                 print_verbose(f"Validation failed: {ia_result}")
-                write_log("ia_scotus_error.log", title, template_text, ia_result)
+                write_log("ia_scotus_error.log", title, template_text, f"{ia_result} ---- {query_url}")
                 if not modified: article_status = api_status
                 continue
                 
