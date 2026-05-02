@@ -219,14 +219,21 @@ def parse_case_string(case_str, template_text=""):
         params["sct"] = f"{m.group(1)} S. Ct. {m.group(2)}"
         return params
         
-    # 5. Match Docket No.
-    m = re.search(r'\b(\d{2}-\d{3,4})\b', clean_str)
+    # 5. Match Docket No. 
+    m = re.search(r'\b(\d{2}[-–]\d{3,4})\b', clean_str)
     if m:
-        print_verbose(f"Matched Docket No: {m.group(1)}")
-        params["docket"] = m.group(1)
+        # Normalize en-dash to standard hyphen for the API
+        clean_docket = m.group(1).replace('–', '-')
+        print_verbose(f"Matched Docket No: {clean_docket}")
+        params["docket"] = clean_docket
         return params
         
-    print_verbose("No valid SCOTUS citation format found. Skipping.")
+    # 6. The Hard Gatekeeper: Must have a strict SCOTUS identifier.
+    # We explicitly exclude "name" here to block lower/state court cases.
+    if "docket" in params or "us" in params or "sct" in params:
+        return params
+
+    print_verbose("No valid SCOTUS citation or docket found.")
     return None
 
 def validate_ia_scotus(query_params):
@@ -241,55 +248,69 @@ def validate_ia_scotus(query_params):
             data = json.loads(response.read().decode('utf-8'))
             return data['response']['numFound'], data['response'].get('docs', []), url
 
-    # --- Stage 1: Strict Citation Search ---
-    lucene_query = "collection:(us-supreme-court)"
-    param_key, param_val = "", ""
-    
-    if "docket" in query_params:
-        lucene_query += f' AND title:"{query_params["docket"]}"'
-        param_key, param_val = "docket", query_params["docket"]
-    elif "us" in query_params:
-        lucene_query += f' AND title:"{query_params["us"]}"'
-        param_key, param_val = "us", query_params["us"]
-    elif "sct" in query_params:
-        lucene_query += f' AND title:"{query_params["sct"]}"'
-        param_key, param_val = "sct", query_params["sct"]
+    hit_count = 0
+    url1 = ""
 
-    try:
-        hit_count, docs, url1 = query_api(lucene_query)
-        print_verbose(f"IA API returned {hit_count} hits for citation search.")
+    # --- Stage 1: Strict Citation Search ---
+    # Guard: ONLY run Stage 1 if we have a strict identifier
+    if "docket" in query_params or "us" in query_params or "sct" in query_params:
+        lucene_query = "collection:(us-supreme-court)"
+        param_key, param_val = "", ""
         
-        if hit_count == 1:
-            doc_id = docs[0]['identifier']
-            print_verbose(f"Success: Exact match found. ID: {doc_id}")
-            return f"{{{{IA SCOTUS URL |id={doc_id}}}}}", f"ID: {doc_id}", "1 item found", url1
+        if "docket" in query_params:
+            lucene_query += f' AND title:"{query_params["docket"]}"'
+            param_key, param_val = "docket", query_params["docket"]
+        elif "us" in query_params:
+            lucene_query += f' AND title:"{query_params["us"]}"'
+            param_key, param_val = "us", query_params["us"]
+        elif "sct" in query_params:
+            lucene_query += f' AND title:"{query_params["sct"]}"'
+            param_key, param_val = "sct", query_params["sct"]
+
+        try:
+            hit_count, docs, url1 = query_api(lucene_query)
+            print_verbose(f"IA API returned {hit_count} hits for citation search.")
             
-        # --- Stage 2: Fallback Literal Name Search ---
-        if hit_count == 0 and "name" in query_params:
-            print_verbose(f"Strict search failed. Trying fallback literal case name: {query_params['name']}")
+            if hit_count == 1:
+                doc_id = docs[0]['identifier']
+                print_verbose(f"Success: Exact match found. ID: {doc_id}")
+                return f"{{{{IA SCOTUS URL |id={doc_id}}}}}", f"ID: {doc_id}", "1 item found", url1
+                
+            elif hit_count == 2:
+                print_verbose("Success: 2 matches found. Falling back to dynamic search template.")
+                return f"{{{{IA SCOTUS URL |{param_key}={param_val}}}}}", "items 2", "2 items found", url1
+                
+            elif hit_count > 2:
+                # If a strict citation hits massive numbers, it's a metadata failure. Skip.
+                return f"SKIP: returned {hit_count} results", f"items {hit_count}", f"{hit_count} items found", url1
+                
+        except Exception as e:
+            print_verbose(f"API Request Error (Stage 1): {str(e)}")
+            return f"ERROR: API request failed - {str(e)}", "API Error", "API Error", "URL generation error"
+
+    # --- Stage 2: Fallback Literal Name Search ---
+    # Trigger if Stage 1 found nothing (0 hits) OR if Stage 1 was bypassed completely
+    if hit_count == 0 and "name" in query_params:
+        print_verbose(f"Strict search failed or bypassed. Trying fallback literal case name: {query_params['name']}")
+        try:
             fallback_query = f'collection:(us-supreme-court) AND title:"{query_params["name"]}"'
             hit_count_2, docs_2, url2 = query_api(fallback_query)
             print_verbose(f"IA API returned {hit_count_2} hits for fallback search.")
             
-            if hit_count_2 == 1:
-                doc_id = docs_2[0]['identifier']
-                print_verbose(f"Fallback Success: Exact match found. ID: {doc_id}")
-                return f"{{{{IA SCOTUS URL |id={doc_id}}}}}", f"ID: {doc_id}", "1 item found (fallback)", url2
-            elif hit_count_2 > 1:
-                return f"SKIP: returned {hit_count_2} results on fallback", f"items {hit_count_2}", f"{hit_count_2} fallback items found", url2
+            if hit_count_2 >= 1:
+                print_verbose(f"Golden Ticket: Found {hit_count_2} related docs. Using dynamic search link.")
+                # Inject the literal string match into the new Wikipedia template parameter
+                search_val = f'title:"{query_params["name"]}"'
+                return f"{{{{IA SCOTUS URL |search={search_val}}}}}", f"items {hit_count_2}", f"{hit_count_2} items found via search", url2
             else:
                 return f"SKIP: returned 0 results", "items 0", "0 items found", url2
+                
+        except Exception as e:
+            print_verbose(f"API Request Error (Stage 2): {str(e)}")
+            return f"ERROR: API request failed - {str(e)}", "API Error", "API Error", "URL generation error"
 
-        # If Stage 1 had exactly 2 hits, fallback to the dynamic template
-        elif hit_count == 2:
-            print_verbose("Success: 2 matches found. Falling back to dynamic search template.")
-            return f"{{{{IA SCOTUS URL |{param_key}={param_val}}}}}", "items 2", "2 items found", url1
-        else:
-            return f"SKIP: returned {hit_count} results", f"items {hit_count}", f"{hit_count} items found", url1
-            
-    except Exception as e:
-        print_verbose(f"API Request Error: {str(e)}")
-        return f"ERROR: API request failed - {str(e)}", "API Error", "API Error", "URL generation error"
+    # Safety Net
+    return f"SKIP: returned 0 results", "items 0", "0 items found", ""
 
 def get_closing_brace(text, start_idx):
     """Robust parser to find the exact closing braces of a wikitext template."""
